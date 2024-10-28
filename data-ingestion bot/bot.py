@@ -1,78 +1,151 @@
+import json
 import os
 import requests
+import aiohttp
+import asyncio
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-
-# Initialize Flask app
 app = Flask(__name__)
 
-ACCESS_TOKEN = ""
-PHONE_NUMBER_ID = ""
 
+load_dotenv()
+ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
+RECIPIENT_WAID = os.getenv("RECIPIENT_WAID")
+PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
+VERSION = os.getenv("VERSION")
+VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
+
+APP_ID = os.getenv("APP_ID")
+APP_SECRET = os.getenv("APP_SECRET")
 
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
+    """Webhook for both GET (verification) and POST (message handling)."""
     if request.method == 'GET':
         return verify_webhook()
     elif request.method == 'POST':
-        return receive_message()
+        return handle_message()
 
 def verify_webhook():
-    verify_token = "my_verify_token"
-    mode = request.args.get("hub.mode")
-    token = request.args.get("hub.verify_token")
-    challenge = request.args.get("hub.challenge")
+    """Verification endpoint for Meta callback."""
+    token = request.args.get('hub.verify_token')
+    challenge = request.args.get('hub.challenge')
 
-    if mode == "subscribe" and token == verify_token:
+    if token == VERIFY_TOKEN:
         print("Webhook verified successfully!")
         return challenge, 200
     else:
         print("Webhook verification failed.")
         return "Forbidden", 403
 
-def receive_message():
+def handle_message():
+    """Handle incoming messages."""
     data = request.get_json()
-    print(f"Received Data: {data}")
+    print(f"Received message: {data}")
+    return jsonify({"status": "received"}), 200
 
-    if 'messages' in data['entry'][0]['changes'][0]['value']:
-        message = data['entry'][0]['changes'][0]['value']['messages'][0]
-        from_number = message['from']
-        msg_body = message.get('text', {}).get('body', '')
 
-        print(f"Message from {from_number}: {msg_body}")
-
-        if message['type'] in ['image', 'document']:
-            media_id = message[message['type']]['id']
-            media_url = get_media_url(media_id)
-            print(f"Media URL: {media_url}")
-            download_media(media_url)
-
-        send_message(from_number, "Message received!")
-
-    return jsonify({"status": "success"}), 200
-
-def get_media_url(media_id):
-    url = f"https://graph.facebook.com/v21.0/{media_id}"
-    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
-    response = requests.get(url, headers=headers).json()
-    return response.get("url")
-
-#def download_media(media_url):
-
-def send_message(to, message):
-    url = f"https://graph.facebook.com/v16.0/{PHONE_NUMBER_ID}/messages"
+def send_whatsapp_message():
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
+        "Authorization": "Bearer " + ACCESS_TOKEN,
+        "Content-Type": "application/json",
     }
-    payload = {
+    data = {
         "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": message}
+        "to": RECIPIENT_WAID,
+        "type": "template",
+        "template": {"name": "hello_world", "language": {"code": "en_US"}},
+    }
+    response = requests.post(url, headers=headers, json=data)
+    return response
+
+
+# Call the function
+response = send_whatsapp_message()
+print(response.status_code)
+print(response.json())
+
+def get_text_message_input(recipient, text):
+    return json.dumps(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": {"preview_url": False, "body": text},
+        }
+    )
+
+
+def send_message(data):
+    headers = {
+        "Content-type": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    print(f"Message sent to {to}: {response.status_code}, {response.text}")
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
 
+    response = requests.post(url, data=data, headers=headers)
+    if response.status_code == 200:
+        print("Status:", response.status_code)
+        print("Content-type:", response.headers["content-type"])
+        print("Body:", response.text)
+        return response
+    else:
+        print(response.status_code)
+        print(response.text)
+        return response
+
+
+data = get_text_message_input(
+    recipient=RECIPIENT_WAID, text="Hello, this is a test message."
+)
+
+response = send_message(data)
+
+
+async def send_message(data):
+    headers = {
+        "Content-type": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+    }
+
+    async with aiohttp.ClientSession() as session:
+        url = "https://graph.facebook.com" + f"/{VERSION}/{PHONE_NUMBER_ID}/messages"
+        try:
+            async with session.post(url, data=data, headers=headers) as response:
+                if response.status == 200:
+                    print("Status:", response.status)
+                    print("Content-type:", response.headers["content-type"])
+
+                    html = await response.text()
+                    print("Body:", html)
+                else:
+                    print(response.status)
+                    print(response)
+        except aiohttp.ClientConnectorError as e:
+            print("Connection Error", str(e))
+
+
+def get_text_message_input(recipient, text):
+    return json.dumps(
+        {
+            "messaging_product": "whatsapp",
+            "recipient_type": "individual",
+            "to": recipient,
+            "type": "text",
+            "text": {"preview_url": False, "body": text},
+        }
+    )
+
+
+data = get_text_message_input(
+    recipient=RECIPIENT_WAID, text="Hello, this is a test message."
+)
+
+loop = asyncio.get_event_loop()
+loop.run_until_complete(send_message(data))
+loop.close()
 if __name__ == "__main__":
     app.run(port=3000, debug=True)
