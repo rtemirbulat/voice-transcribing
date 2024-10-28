@@ -1,2 +1,2 @@
 # voice-transcribing
-voice transcribing model
+voice transcribing model and data-ingestion bot
