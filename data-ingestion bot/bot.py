@@ -9,6 +9,7 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from waitress import serve
 
 app = Flask(__name__)
 
@@ -276,4 +277,4 @@ async def send_text_message(recipient_id, message_body):
     await send_async_message(data)
 
 if __name__ == "__main__":
-    app.run(port=3000, debug=True)
+    serve(app, host='0.0.0.0', port=3000)
