@@ -6,13 +6,13 @@ import asyncio
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from flask import abort
 
 app = Flask(__name__)
 
 # Load environment variables
 load_dotenv()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
-RECIPIENT_WAID = os.getenv("RECIPIENT_WAID")
 PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
@@ -46,25 +46,55 @@ def handle_message():
     data = request.get_json()
     print(f"Received data: {json.dumps(data, indent=2)}")
 
-    entry = data.get('entry', [])[0]
-    changes = entry.get('changes', [])[0].get('value', {})
-    messages = changes.get('messages', [])
+    messages = []
+    from_number = None
+
+    # Extract messages from the incoming data
+    try:
+        entry = data['entry'][0]
+        changes = entry['changes'][0]
+        value = changes['value']
+        messages = value.get('messages', [])
+    except (KeyError, IndexError) as e:
+        print("No messages found in the webhook data.")
+        return jsonify({"status": "no_messages"}), 200
+
+    # Initialize counts
+    counts = {
+        'text': 0,
+        'image': 0,
+        'video': 0,
+        'audio': 0,
+        'document': 0,
+        'voice': 0,
+        'others': 0
+    }
 
     for message in messages:
         from_number = message.get('from')
         timestamp = datetime.fromtimestamp(int(message.get('timestamp')))
         formatted_time = timestamp.strftime('%Y-%m-%d_%H-%M-%S')
+        message_type = message.get('type')
 
-        if message['type'] == 'text':
+        if message_type == 'text':
+            counts['text'] += 1
             text = message['text']['body']
             print(f"Received text from {from_number}: {text}")
             save_message(from_number, text, formatted_time)
 
-        elif message['type'] in ['image', 'video', 'audio', 'document']:
-            media_id = message[message['type']]['id']
+        elif message_type in ['image', 'video', 'audio', 'document', 'voice']:
+            counts[message_type] += 1
+            media_id = message[message_type]['id']
             media_url = get_media_url(media_id)
-            media_type = message['type']
-            download_media(media_url, media_type, from_number, formatted_time)
+            download_media(media_url, message_type, from_number, formatted_time)
+
+        else:
+            counts['others'] += 1
+            print(f"Received {message_type} message from {from_number}")
+
+    # After processing, send a reply
+    if from_number:
+        asyncio.run(send_reply(from_number, counts))
 
     return jsonify({"status": "received"}), 200
 
@@ -80,19 +110,15 @@ def download_media(url, media_type, from_number, timestamp):
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     response = requests.get(url, headers=headers, stream=True)
 
-    # Determine the correct file extension
-    if media_type == 'audio':
-        extension = '.wav'
-    elif media_type == 'image':
-        extension = '.jpg'
-    elif media_type == 'video':
-        extension = '.mp4'
-    elif media_type == 'document':
-        extension = '.pdf'
-    else:
-        extension = '.media'
+    extension_mapping = {
+        'audio': '.wav',
+        'voice': '.wav',
+        'image': '.jpg',
+        'video': '.mp4',
+        'document': '.pdf',
+    }
+    extension = extension_mapping.get(media_type, '.media')
 
-    # Construct the filename and path
     filename = f"{from_number}_{media_type}_{timestamp}{extension}"
     filepath = os.path.join("media", filename)
 
@@ -102,6 +128,7 @@ def download_media(url, media_type, from_number, timestamp):
             f.write(chunk)
 
     print(f"Media saved at: {filepath}")
+
 
 
 def save_message(from_number, text, timestamp):
@@ -116,7 +143,6 @@ def save_message(from_number, text, timestamp):
 
     print(f"Message saved at: {filepath}")
 
-# Asynchronous function to send a WhatsApp message
 async def send_async_message(data):
     headers = {
         "Content-Type": "application/json",
@@ -126,28 +152,52 @@ async def send_async_message(data):
 
     async with aiohttp.ClientSession() as session:
         async with session.post(url, json=data, headers=headers) as response:
-            if response.status == 200:
+            response_text = await response.text()
+            if response.status in [200, 201]:
                 print("Async message sent successfully!")
-                print(await response.text())
+                print(response_text)
             else:
                 print(f"Async send failed: {response.status}")
-                print(await response.text())
+                print(response_text)
+
 
 def get_text_message_input(recipient, text):
-    """Generate JSON payload for text message."""
+    # Remove '+' sign
+    formatted_recipient = recipient.lstrip('+')
+
+    # Remove the first '7' (country code)
+    if formatted_recipient.startswith('7'):
+        formatted_recipient = formatted_recipient[1:]
+
+    # Prepend '78' to the number
+    formatted_recipient = '78' + formatted_recipient
+
+    print(f"Formatted recipient number: {formatted_recipient}")
     return {
         "messaging_product": "whatsapp",
-        "to": recipient,
+        "to": formatted_recipient,
         "type": "text",
-        "text": {"body": text, "preview_url": False},
+        "text": {"body": text}
     }
 
-if __name__ == "__main__":
-    # Test sending a message asynchronously
-    text_data = get_text_message_input(RECIPIENT_WAID, "Hello from WhatsApp!")
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(send_async_message(text_data))
 
-    # Run Flask app
+async def send_reply(recipient_id, counts):
+    """Send a reply message with the counts of received messages."""
+    message_lines = []
+    for msg_type, count in counts.items():
+        if count > 0:
+            message_lines.append(f"{count} {msg_type} message(s)")
+
+    if message_lines:
+        message_body = "Received:\n" + "\n".join(message_lines)
+    else:
+        message_body = "No messages received."
+
+    data = get_text_message_input(recipient_id, message_body)
+
+    await send_async_message(data)
+
+
+if __name__ == "__main__":
     app.run(port=3000, debug=True)
 
