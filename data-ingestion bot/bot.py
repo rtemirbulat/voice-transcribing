@@ -3,6 +3,7 @@ import json
 import requests
 import aiohttp
 import asyncio
+import re
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
@@ -23,8 +24,10 @@ os.makedirs("messages", exist_ok=True)
 
 # Global dictionary to store user authentication status
 user_sessions = {}
+# Media sequence
+media_sequence = {}
 
-
+# To verify webhooks
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
     """Webhook endpoint for verification and message handling."""
@@ -45,6 +48,7 @@ def verify_webhook():
         print("Webhook verification failed.")
         return "Forbidden", 403
 
+# Main functionality
 def handle_message():
     """Handle incoming messages and download media if authenticated."""
     data = request.get_json()
@@ -53,7 +57,7 @@ def handle_message():
     messages = []
     from_number = None
 
-    # Extract messages from the incoming data
+
     try:
         entry = data['entry'][0]
         changes = entry['changes'][0]
@@ -66,28 +70,29 @@ def handle_message():
     for message in messages:
         from_number = message.get('from')
         timestamp = datetime.fromtimestamp(int(message.get('timestamp')))
-        formatted_time = timestamp.strftime('%Y-%m-%d_%H-%M-%S')
+        formatted_time = timestamp.strftime('%Y-%m-%d_%H-%M')
         message_type = message.get('type')
         message_body = message.get('text', {}).get('body', '').lower()
 
-        # Initialize user session if not present
+
         if from_number not in user_sessions:
             user_sessions[from_number] = {'authenticated': False, 'awaiting_password': False}
 
-        # Check if the user is authenticated
-        is_authenticated = user_sessions[from_number]['authenticated']
 
-        # Handle the 'start' command
+        is_authenticated = user_sessions[from_number]['authenticated']
+        awaiting_password = user_sessions[from_number]['awaiting_password']
+
+
         if message_type == 'text' and (message_body == 'start' or message_body == 'старт'):
-            # Ask for the password
-            asyncio.run(send_text_message(from_number, "Отправьте 4-х значный код для запуска:"))
-            # Set a flag to indicate that the bot is waiting for a password
+
+            asyncio.run(send_text_message(from_number, "Введите 4-х значный код для входа"))
+
             user_sessions[from_number]['awaiting_password'] = True
             return jsonify({"status": "password_requested"}), 200
 
-        # Handle password entry
-        elif message_type == 'text' and user_sessions[from_number]['awaiting_password']:
-            # Verify the password
+
+        elif message_type == 'text' and awaiting_password:
+
             entered_password = message.get('text', {}).get('body', '')
             if entered_password == AUTH_PASSWORD:
                 user_sessions[from_number]['authenticated'] = True
@@ -96,12 +101,13 @@ def handle_message():
             else:
                 user_sessions[from_number]['authenticated'] = False
                 user_sessions[from_number]['awaiting_password'] = False
-                asyncio.run(send_text_message(from_number, "Кодовое слово неверно. Отправьте старт и попробуйте заново."))
+                asyncio.run(send_text_message(from_number, "Неверный код. Введите слово 'cтарт' и попробуйте еще раз"))
             return jsonify({"status": "authentication_attempted"}), 200
 
-        # If the user is not authenticated, ignore the message
-        if not is_authenticated:
-            print(f"User {from_number} is not authenticated. Ignoring message.")
+
+        if not is_authenticated and not awaiting_password:
+            print(f"User {from_number} is not authenticated. Prompting to register.")
+            asyncio.run(send_text_message(from_number, "Для работы с ботом требуется код. Введите старт и пройдите проверку"))
             return jsonify({"status": "not_authenticated"}), 200
 
         # The user is authenticated; proceed to process and save the message
@@ -115,7 +121,6 @@ def handle_message():
             'others': 0
         }
 
-        # Process the message as per your existing code
         if message_type == 'text':
             counts['text'] += 1
             text = message['text']['body']
@@ -132,7 +137,6 @@ def handle_message():
             counts['others'] += 1
             print(f"Received {message_type} message from {from_number}")
 
-        # After processing, send a reply
         if from_number:
             asyncio.run(send_reply(from_number, counts))
 
@@ -146,8 +150,25 @@ def get_media_url(media_id):
     response = requests.get(url, headers=headers).json()
     return response.get('url')
 
+
+
+def get_next_sequence_number(phone_dir, media_type):
+    sequence_numbers = []
+    pattern = re.compile(rf"{media_type}_(\d+)_")
+
+    for filename in os.listdir(phone_dir):
+        match = pattern.match(filename)
+        if match:
+            sequence_numbers.append(int(match.group(1)))
+
+    if sequence_numbers:
+        return max(sequence_numbers) + 1
+    else:
+        return 1
+
+
 def download_media(url, media_type, from_number, timestamp):
-    """Download media files and save them with proper extensions."""
+    """Download media files and save them with the specified naming."""
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     response = requests.get(url, headers=headers, stream=True)
 
@@ -159,11 +180,14 @@ def download_media(url, media_type, from_number, timestamp):
         'document': '.pdf',
     }
     extension = extension_mapping.get(media_type, '.media')
+    timestamp_without_seconds = "_".join(timestamp.split("_")[:-1])
+    phone_dir = os.path.join("media", from_number)
+    os.makedirs(phone_dir, exist_ok=True)
+    sequence_number = get_next_sequence_number(phone_dir, media_type)
 
-    filename = f"{from_number}_{media_type}_{timestamp}{extension}"
-    filepath = os.path.join("media", filename)
+    filename = f"{media_type}_{sequence_number}_{timestamp_without_seconds}{extension}"
+    filepath = os.path.join(phone_dir, filename)
 
-    # Save the file
     with open(filepath, "wb") as f:
         for chunk in response.iter_content(1024):
             f.write(chunk)
@@ -171,18 +195,16 @@ def download_media(url, media_type, from_number, timestamp):
     print(f"Media saved at: {filepath}")
 
 
-
 def save_message(from_number, text, timestamp):
-    """Save text messages to a file."""
-    filename = f"{from_number}_{timestamp}.txt"
+    filename = f"{from_number}.txt"
     filepath = os.path.join("messages", filename)
 
-    with open(filepath, "w") as f:
-        f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"From: {from_number}\n")
-        f.write(f"Message: {text}\n")
+    message_content = f"Timestamp: {timestamp}\nFrom: {from_number}\nMessage: {text}\n\n"
 
-    print(f"Message saved at: {filepath}")
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(message_content)
+
+    print(f"Message appended to: {filepath}")
 
 async def send_async_message(data):
     headers = {
@@ -204,11 +226,8 @@ async def send_async_message(data):
 
 def get_text_message_input(recipient, text):
     """Generate JSON payload for text message."""
-    # Remove '+' sign
     formatted_recipient = recipient.lstrip('+')
-
-    # Apply any necessary formatting adjustments
-    # For your specific case, adjust the number format
+    # Works only for KZ numbers
     if formatted_recipient.startswith('7'):
         formatted_recipient = '78' + formatted_recipient[1:]
     else:
@@ -227,21 +246,33 @@ def get_text_message_input(recipient, text):
 async def send_reply(recipient_id, counts):
     """Send a reply message with the counts of received messages."""
     message_lines = []
+
+    msg_type_forms = {
+        'text': ('текстовое сообщение'),
+        'image': ('изображения'),
+        'video': ('видео'),
+        'audio': ('аудио'),
+        'document': ('документ'),
+        'voice': ('голосовое сообщение'),
+        'others': ('других сообщений'),
+    }
+
+
     for msg_type, count in counts.items():
+
         if count > 0:
-            message_lines.append(f"{count} {msg_type} message(s)")
+            message_lines.append(f"{count} {msg_type_forms.get(msg_type)} сообщени(й)")
 
     if message_lines:
-        message_body = "Received:\n" + "\n".join(message_lines)
+        message_body = "Получено:\n" + "\n".join(message_lines)
     else:
-        message_body = "No messages received."
+        message_body = "Сообщения не получены."
 
     data = get_text_message_input(recipient_id, message_body)
 
     await send_async_message(data)
 
 async def send_text_message(recipient_id, message_body):
-    """Send a simple text message."""
     data = get_text_message_input(recipient_id, message_body)
     await send_async_message(data)
 
