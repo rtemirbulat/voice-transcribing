@@ -9,7 +9,6 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from waitress import serve
 
 app = Flask(__name__)
 
@@ -185,12 +184,12 @@ def download_media(url, media_type, from_number, timestamp):
         'document': '.pdf',
     }
     extension = extension_mapping.get(media_type, '.media')
-    timestamp_without_seconds = "_".join(timestamp.split("_")[:-1])
+
     phone_dir = os.path.join("media", from_number)
     os.makedirs(phone_dir, exist_ok=True)
     sequence_number = get_next_sequence_number(phone_dir, media_type)
 
-    filename = f"{media_type}_{sequence_number}_{timestamp_without_seconds}{extension}"
+    filename = f"{media_type}_{sequence_number}_{timestamp}{extension}"
     filepath = os.path.join(phone_dir, filename)
 
     with open(filepath, "wb") as f:
@@ -198,6 +197,7 @@ def download_media(url, media_type, from_number, timestamp):
             f.write(chunk)
 
     logger.info(f"Media saved at: {filepath}")
+
 
 def save_message(from_number, text, timestamp):
     filename = f"{from_number}.txt"
@@ -275,6 +275,3 @@ async def send_reply(recipient_id, counts):
 async def send_text_message(recipient_id, message_body):
     data = get_text_message_input(recipient_id, message_body)
     await send_async_message(data)
-
-if __name__ == "__main__":
-    serve(app, host='0.0.0.0', port=3000)
