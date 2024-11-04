@@ -10,7 +10,6 @@ from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
 
-
 app = Flask(__name__)
 
 # Load environment variables
@@ -183,6 +182,7 @@ def download_media(url, media_type, from_number, timestamp):
         'document': '.pdf',
     }
     extension = extension_mapping.get(media_type, '.media')
+
     date_str = timestamp.strftime('%Y-%m-%d')
     time_str = timestamp.strftime('%H-%M-%S-%f') #thinking about adding microseconds
     phone_dir = os.path.join("media", from_number, date_str)
@@ -204,6 +204,7 @@ def download_media(url, media_type, from_number, timestamp):
         filepath = None
 
     return filepath, filename, success
+
 
 def save_message(from_number, text, timestamp):
     filename = f"{from_number}.txt"
@@ -281,4 +282,3 @@ async def send_reply(recipient_id, counts):
 async def send_text_message(recipient_id, message_body):
     data = get_text_message_input(recipient_id, message_body)
     await send_async_message(data)
-
