@@ -9,7 +9,7 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from waitress import serve
+
 
 app = Flask(__name__)
 
@@ -116,7 +116,7 @@ def handle_message():
 
         if not is_authenticated and not awaiting_password:
             logger.info(f"User {from_number} is not authenticated. Prompting to register.")
-            asyncio.run(send_text_message(from_number, "Для работы с ботом требуется код. Введите старт и пройдите проверку"))
+            asyncio.run(send_text_message(from_number, "Для работы с ботом требуется код. Введите 'старт' и пройдите проверку"))
             return jsonify({"status": "not_authenticated"}), 200
 
         # The user is authenticated; proceed to process and save the message
@@ -173,10 +173,8 @@ def get_next_sequence_number(phone_dir, media_type):
         return 1
 
 def download_media(url, media_type, from_number, timestamp):
-    """Download media files and save them with the specified naming."""
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     response = requests.get(url, headers=headers, stream=True)
-
     extension_mapping = {
         'audio': '.wav',
         'voice': '.wav',
@@ -185,19 +183,27 @@ def download_media(url, media_type, from_number, timestamp):
         'document': '.pdf',
     }
     extension = extension_mapping.get(media_type, '.media')
-    timestamp_without_seconds = "_".join(timestamp.split("_")[:-1])
-    phone_dir = os.path.join("media", from_number)
+    date_str = timestamp.strftime('%Y-%m-%d')
+    time_str = timestamp.strftime('%H-%M-%S-%f') #thinking about adding microseconds
+    phone_dir = os.path.join("media", from_number, date_str)
     os.makedirs(phone_dir, exist_ok=True)
     sequence_number = get_next_sequence_number(phone_dir, media_type)
 
-    filename = f"{media_type}_{sequence_number}_{timestamp_without_seconds}{extension}"
+    filename = f"{media_type}_{sequence_number}_{time_str}{extension}"
     filepath = os.path.join(phone_dir, filename)
 
-    with open(filepath, "wb") as f:
-        for chunk in response.iter_content(1024):
-            f.write(chunk)
+    try:
+        with open(filepath, "wb") as f:
+            for chunk in response.iter_content(1024):
+                f.write(chunk)
+        logger.info(f"Media saved at: {filepath}")
+        success = True
+    except Exception as e:
+        logger.error(f"Failed to save media: {e}")
+        success = False
+        filepath = None
 
-    logger.info(f"Media saved at: {filepath}")
+    return filepath, filename, success
 
 def save_message(from_number, text, timestamp):
     filename = f"{from_number}.txt"
@@ -276,5 +282,3 @@ async def send_text_message(recipient_id, message_body):
     data = get_text_message_input(recipient_id, message_body)
     await send_async_message(data)
 
-if __name__ == "__main__":
-    serve(app, host='0.0.0.0', port=3000)
