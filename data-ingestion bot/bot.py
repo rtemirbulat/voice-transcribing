@@ -9,7 +9,10 @@ from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, text
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from sqlalchemy.exc import SQLAlchemyError
+import pytz
 app = Flask(__name__)
 
 # Load environment variables
@@ -19,6 +22,7 @@ PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 VERSION = os.getenv("VERSION")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 AUTH_PASSWORD = os.getenv("AUTH_PASSWORD")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Ensure necessary directories exist
 os.makedirs("logs", exist_ok=True)
@@ -44,17 +48,45 @@ user_sessions = {}
 # Media sequence
 media_sequence = {}
 
+#SQLAlchemy setup
+engine = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+#DB models
+class PhoneNumber(Base):
+    __tablename__ = 'phone_num'
+
+    phone_num = Column(String, primary_key=True, unique=True, nullable=False)
+    name = Column(String, nullable=False)
+    whatsapp_name = Column(String, nullable=True)  # Fetched from WhatsApp Cloud API
+
+    messages = relationship("Message", back_populates="phone_number_ref")
+
+class Message(Base):
+    __tablename__ = 'messages'
+
+    id = Column(Integer, primary_key=True, index=True)
+    phone_num = Column(String, ForeignKey('phone_num.phone_num'), nullable=False)
+    name = Column(String, nullable=False)  # Redundant but useful for quick access
+    message_text = Column(Text, nullable=True)
+    hasAttachments = Column(Boolean, default=False)
+    attachment_links = Column(Text, nullable=True)  # Comma-separated links
+    date_time = Column(DateTime, nullable=False)
+
+    phone_number_ref = relationship("PhoneNumber", back_populates="messages")
+
+
+
 # To verify webhooks
 @app.route('/webhook', methods=['GET', 'POST'])
 def webhook():
-    """Webhook endpoint for verification and message handling."""
     if request.method == 'GET':
         return verify_webhook()
     elif request.method == 'POST':
         return handle_message()
 
 def verify_webhook():
-    """Verify the webhook using the token."""
     token = request.args.get('hub.verify_token')
     challenge = request.args.get('hub.challenge')
 
@@ -67,7 +99,6 @@ def verify_webhook():
 
 # Main functionality
 def handle_message():
-    """Handle incoming messages and download media if authenticated."""
     data = request.get_json()
     logger.debug(f"Received data: {json.dumps(data)}")
 
@@ -83,10 +114,15 @@ def handle_message():
         logger.info("No messages found in the webhook data.")
         return jsonify({"status": "no_messages"}), 200
 
+    session = SessionLocal()
+
     for message in messages:
         from_number = message.get('from')
-        timestamp = datetime.fromtimestamp(int(message.get('timestamp')))
-        formatted_time = timestamp.strftime('%Y-%m-%d_%H-%M')
+        timestamp = datetime.fromtimestamp(int(message.get('timestamp')), pytz.utc)
+        # Convert to UTC+5
+        utc_plus_5 = pytz.timezone('Etc/GMT-5')  # Etc/GMT-5 is UTC+5
+        timestamp = timestamp.astimezone(utc_plus_5)
+        formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
         message_type = message.get('type')
         message_body = message.get('text', {}).get('body', '').lower()
 
@@ -110,7 +146,7 @@ def handle_message():
             else:
                 user_sessions[from_number]['authenticated'] = False
                 user_sessions[from_number]['awaiting_password'] = False
-                asyncio.run(send_text_message(from_number, "Неверный код. Введите слово 'cтарт' и попробуйте еще раз"))
+                asyncio.run(send_text_message(from_number, "Неверный код. Введите слово 'старт' и попробуйте еще раз"))
             return jsonify({"status": "authentication_attempted"}), 200
 
         if not is_authenticated and not awaiting_password:
@@ -129,26 +165,90 @@ def handle_message():
             'others': 0
         }
 
+        has_attachments = False
+        attachment_links = []
+
         if message_type == 'text':
-            counts['text'] += 1
+            # Process text message
             text = message['text']['body']
             logger.info(f"Received text from {from_number}: {text}")
             save_message(from_number, text, formatted_time)
+            # Save to database
+            save_message_to_db(
+                session=session,
+                phone_num=from_number,
+                message_text=text,
+                has_attachments=False,
+                attachment_links='',
+                date_time=timestamp
+            )
 
         elif message_type in ['image', 'video', 'audio', 'document', 'voice']:
             counts[message_type] += 1
             media_id = message[message_type]['id']
             media_url = get_media_url(media_id)
-            download_media(media_url, message_type, from_number, formatted_time)
-
+            filepath, filename, success = download_media(media_url, message_type, from_number, timestamp)
+            if success:
+                has_attachments = True
+                attachment_links = filepath  # Modify if handling multiple attachments
+                # Save to database
+                save_message_to_db(
+                    session=session,
+                    phone_num=from_number,
+                    message_text='',
+                    has_attachments=True,
+                    attachment_links=filepath,
+                    date_time=timestamp
+                )
+                # Notify user
+                asyncio.run(send_async_message_status(from_number, filepath, success))
+            else:
+                # Notify user about failure
+                asyncio.run(send_async_message_status(from_number, filepath, success))
         else:
             counts['others'] += 1
             logger.info(f"Received {message_type} message from {from_number}")
+            # Save to database without text or attachments
+            save_message_to_db(
+                session=session,
+                phone_num=from_number,
+                message_text='',
+                has_attachments=False,
+                attachment_links='',
+                date_time=timestamp
+            )
 
         if from_number:
             asyncio.run(send_reply(from_number, counts))
 
     return jsonify({"status": "received"}), 200
+
+async def send_reply(recipient_id, counts):
+    message_lines = []
+
+    msg_type_forms = {
+        'text': 'текстовое сообщение',
+        'image': 'изображения',
+        'video': 'видео',
+        'audio': 'аудио',
+        'document': 'документ',
+        'voice': 'голосовое сообщение',
+        'others': 'других сообщений',
+    }
+
+    for msg_type, count in counts.items():
+        if count > 0:
+            message_lines.append(f"{count} {msg_type_forms.get(msg_type)} сообщени(й)")
+
+    if message_lines:
+        message_body = "Получено:\n" + "\n".join(message_lines)
+    else:
+        message_body = "Сообщения не получены."
+
+    data = get_text_message_input(recipient_id, message_body)
+
+    await send_async_message(data)
+
 
 def get_media_url(media_id):
     """Retrieve media download URL from WhatsApp Cloud API."""
@@ -252,33 +352,118 @@ def get_text_message_input(recipient, text):
         "text": {"body": text}
     }
 
-async def send_reply(recipient_id, counts):
-    """Send a reply message with the counts of received messages."""
-    message_lines = []
-
-    msg_type_forms = {
-        'text': 'текстовое сообщение',
-        'image': 'изображения',
-        'video': 'видео',
-        'audio': 'аудио',
-        'document': 'документ',
-        'voice': 'голосовое сообщение',
-        'others': 'других сообщений',
-    }
-
-    for msg_type, count in counts.items():
-        if count > 0:
-            message_lines.append(f"{count} {msg_type_forms.get(msg_type)} сообщени(й)")
-
-    if message_lines:
-        message_body = "Получено:\n" + "\n".join(message_lines)
-    else:
-        message_body = "Сообщения не получены."
-
-    data = get_text_message_input(recipient_id, message_body)
-
-    await send_async_message(data)
 
 async def send_text_message(recipient_id, message_body):
     data = get_text_message_input(recipient_id, message_body)
     await send_async_message(data)
+
+def get_or_create_phone_number(session, phone_num):
+    """Fetch a PhoneNumber entry or create it if it doesn't exist."""
+    phone_entry = session.query(PhoneNumber).filter_by(phone_num=phone_num).first()
+    if phone_entry:
+        return phone_entry
+    else:
+        # Fetch whatsapp_name from WhatsApp Cloud API
+        whatsapp_name = fetch_whatsapp_name(phone_num)
+        # Create a new PhoneNumber entry with 'Unknown' name if not found
+        new_entry = PhoneNumber(
+            phone_num=phone_num,
+            name='Unknown',  # You can modify this to prompt user or fetch from another source
+            whatsapp_name=whatsapp_name
+        )
+        session.add(new_entry)
+        try:
+            session.commit()
+            logger.info(f"Inserted new phone number {phone_num} with WhatsApp name '{whatsapp_name}'.")
+        except SQLAlchemyError as e:
+            logger.error(f"Error inserting phone number {phone_num}: {e}")
+            session.rollback()
+        return new_entry
+
+def fetch_whatsapp_name(phone_num):
+    """Fetch the WhatsApp name for the given phone number using WhatsApp Cloud API."""
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/contacts"
+    params = {'phone_number': phone_num}
+    headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
+    response = requests.get(url, headers=headers, params=params)
+
+    if response.status_code == 200:
+        data = response.json()
+        # Adjust based on actual response structure
+        whatsapp_name = data.get('name', 'Unknown')
+        logger.info(f"Fetched WhatsApp name for {phone_num}: {whatsapp_name}")
+        return whatsapp_name
+    else:
+        logger.warning(f"Failed to fetch WhatsApp name for {phone_num}: {response.text}")
+        return 'Unknown'
+
+
+def save_message_to_db(session, phone_num, message_text, has_attachments, attachment_links, date_time):
+    """Save a message to the database."""
+    phone_entry = get_or_create_phone_number(session, phone_num)
+    if not phone_entry:
+        logger.error(f"Failed to retrieve or create phone number entry for {phone_num}. Skipping message save.")
+        return
+    message_entry = Message(
+        phone_num=phone_num,
+        name=phone_entry.name,
+        message_text=message_text,
+        hasAttachments=has_attachments,
+        attachment_links=attachment_links,
+        date_time=date_time
+    )
+    session.add(message_entry)
+    try:
+        session.commit()
+        logger.info(f"Saved message from {phone_num} to database.")
+    except SQLAlchemyError as e:
+        logger.error(f"Error saving message from {phone_num}: {e}")
+        session.rollback()
+
+
+async def send_async_message_status(recipient_id, filepath, success):
+
+    if success:
+        message_body = f"Изображение успешно сохранено в {filepath}"
+    else:
+        message_body = "Не удалось сохранить изображение"
+    await send_text_message(recipient_id, message_body)
+
+def insert_phone_number(phone_num: str, name: str, whatsapp_name: str):
+    session = SessionLocal()
+    try:
+        existing = session.query(PhoneNumber).filter_by(phone_num=phone_num).first()
+        if existing:
+            logger.info(f"Phone number {phone_num} already exists with name {existing.name}.")
+            return
+        new_entry = PhoneNumber(
+            phone_num=phone_num,
+            name=name,
+            whatsapp_name=whatsapp_name
+        )
+        session.add(new_entry)
+        session.commit()
+        logger.info(f"Inserted phone number {phone_num} with name {name} and WhatsApp name '{whatsapp_name}'.")
+    except SQLAlchemyError as e:
+        logger.error(f"Error inserting phone number {phone_num}: {e}")
+        session.rollback()
+    finally:
+        session.close()
+
+def test_connection():
+    try:
+        engine = create_engine(DATABASE_URL)
+        with engine.connect() as connection:
+            result = connection.execute(text("SELECT 1"))
+            fetched = result.fetchone()
+            print("Database connection successful:", fetched)
+    except SQLAlchemyError as e:
+        print("Database connection failed:", e)
+
+def create_tables():
+    Base.metadata.create_all(bind=engine)
+
+if __name__ == "__main__":
+    test_connection()
+    create_tables()
+    app.run(host='0.0.0.0', port=3000)
