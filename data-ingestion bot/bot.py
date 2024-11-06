@@ -13,6 +13,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from sqlalchemy.exc import SQLAlchemyError
 import pytz
+from pydub import AudioSegment
 
 app = Flask(__name__)
 
@@ -166,9 +167,6 @@ def handle_message():
                 send_text_message(from_number, "Для работы с ботом требуется код. Введите 'старт' и пройдите проверку"))
             return jsonify({"status": "not_authenticated"}), 200
 
-
-
-
         counts = {
             'text': 0,
             'image': 0,
@@ -261,14 +259,31 @@ def get_next_sequence_number(phone_dir, media_type):
 def download_media(url, media_type, from_number, timestamp):
     headers = {"Authorization": f"Bearer {ACCESS_TOKEN}"}
     response = requests.get(url, headers=headers, stream=True)
-    extension_mapping = {
-        'audio': '.wav',
-        'voice': '.wav',
+
+    # Get the content type from the headers
+    content_type = response.headers.get('Content-Type', '')
+    logger.info(f"Content-Type: {content_type}")
+    # Mapping
+    content_type_mapping = {
+        'audio/mpeg': ('.mp3', 'mp3'),
+        'audio/mp3': ('.mp3', 'mp3'),
+        'audio/ogg': ('.ogg', 'ogg'),
+        'audio/opus': ('.opus', 'opus'),
+        'audio/x-m4a': ('.m4a', 'm4a'),
+        'audio/aac': ('.aac', 'aac'),
+        'audio/wav': ('.wav', 'wav'),
+        'audio/x-wav': ('.wav', 'wav'),
+        'audio/webm': ('.webm', 'webm'),
         'image': '.jpg',
         'video': '.mp4',
         'document': '.pdf',
     }
-    extension = extension_mapping.get(media_type, '.media')
+    if content_type in content_type_mapping:
+        extension, audio_format = content_type_mapping[content_type]
+    else:
+        # Default to .media and 'wav' if unknown
+        extension = '.media'
+        audio_format = 'wav'
 
     date_str = timestamp.strftime('%Y-%m-%d')
     time_str = timestamp.strftime('%H-%M-%S')
@@ -276,21 +291,50 @@ def download_media(url, media_type, from_number, timestamp):
     os.makedirs(phone_dir, exist_ok=True)
     sequence_number = get_next_sequence_number(phone_dir, media_type)
 
-    filename = f"{media_type}_{sequence_number}_{time_str}{extension}"
-    filepath = os.path.join(phone_dir, filename)
+    original_filename = f"{media_type}_{sequence_number}_{time_str}{extension}"
+    original_filepath = os.path.join(phone_dir, original_filename)
+
 
     try:
-        with open(filepath, "wb") as f:
+        with open(original_filepath, "wb") as f:
             for chunk in response.iter_content(1024):
                 f.write(chunk)
-        logger.info(f"Media saved at: {filepath}")
+        logger.info(f"Media saved at: {original_filepath}")
         success = True
+
+        # If the media is audio or voice, convert it to WAV
+        if media_type in ['audio', 'voice']:
+            try:
+                # Load the audio file using the detected format
+                audio = AudioSegment.from_file(original_filepath, format=audio_format)
+
+                # Define the WAV filename
+                wav_filename = f"{media_type}_{sequence_number}_{time_str}.wav"
+                wav_filepath = os.path.join(phone_dir, wav_filename)
+
+                # Export the audio in WAV format with high quality
+                audio.export(wav_filepath, format="wav", bitrate="192k")  # Adjust bitrate as needed
+
+                logger.info(f"Converted audio saved at: {wav_filepath}")
+
+                # Optionally, delete the original file to save space
+                os.remove(original_filepath)
+                logger.info(f"Deleted original file: {original_filepath}")
+
+                return wav_filepath, wav_filename, True
+
+            except Exception as e:
+                logger.error(f"Failed to convert audio to WAV: {e}")
+                return original_filepath, original_filename, False
+
+        else:
+            return original_filepath, original_filename, True
+
     except Exception as e:
         logger.error(f"Failed to save media: {e}")
         success = False
-        filepath = None
-
-    return filepath, filename, success
+        original_filepath = None
+        return original_filepath, original_filename, success
 
 
 # save message text
