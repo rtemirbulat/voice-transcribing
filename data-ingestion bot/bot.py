@@ -1,19 +1,21 @@
-import os
-import json
-import requests
-import aiohttp
 import asyncio
-import re
+import json
 import logging
-from logging.handlers import TimedRotatingFileHandler
+import os
+import re
 from datetime import datetime
+from logging.handlers import TimedRotatingFileHandler
+
+import aiohttp
+import pytz
+import requests
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, text
-from sqlalchemy.orm import declarative_base, sessionmaker, relationship
-from sqlalchemy.exc import SQLAlchemyError
-import pytz
 from pydub import AudioSegment
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, Text, ForeignKey, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+from script import send_audio_to_api
 
 app = Flask(__name__)
 
@@ -51,7 +53,7 @@ user_sessions = {}
 media_sequence = {}
 
 #SQLAlchemy setup
-engine = create_engine(DATABASE_URL,echo=True)
+engine = create_engine(DATABASE_URL, echo=True)
 SessionLocal = sessionmaker(bind=engine)
 Base = declarative_base()
 
@@ -84,8 +86,22 @@ class Message(Base):
     cdng = Column(String, nullable=True)
     ngdu = Column(String, nullable=True)
     ip_address = Column(String, nullable=True)
-
+    result = relationship("Result", uselist=False, back_populates="message")
     phone_number_ref = relationship("PhoneNumber", back_populates="messages")
+
+
+class Result(Base):
+    __tablename__ = 'results'
+
+    id = Column(Integer, primary_key=True, index=True)
+    message_id = Column(Integer, ForeignKey('messages.id'))
+    audio_file_path = Column(String, nullable=False)
+    audio_file_name = Column(String, nullable=False)
+    models_output = Column(Text, nullable=True)
+    corrected = Column(Boolean, default=False)
+    human_output = Column(Text, nullable=True)
+
+    message = relationship("Message", back_populates="result")
 
 
 # To verify webhooks
@@ -127,110 +143,196 @@ def handle_message():
         return jsonify({"status": "no_messages"}), 200
 
     session = SessionLocal()
+    try:
+        for message in messages:
+            from_number = message.get('from')
+            timestamp = datetime.fromtimestamp(int(message.get('timestamp')), pytz.utc)
+            # Convert to UTC+5
+            utc_plus_5 = pytz.timezone('Asia/Yekaterinburg')  # Replace with the appropriate time zone
+            timestamp = timestamp.astimezone(utc_plus_5)
+            # Make the datetime naive by removing the tzinfo
+            timestamp_naive = timestamp.replace(tzinfo=None)
+            formatted_time = timestamp_naive.strftime('%Y-%m-%d %H:%M:%S')
+            message_type = message.get('type')
+            message_body = message.get('text', {}).get('body', '').lower()
 
-    for message in messages:
-        from_number = message.get('from')
-        timestamp = datetime.fromtimestamp(int(message.get('timestamp')), pytz.utc)
-        # Convert to UTC+5
-        utc_plus_5 = pytz.timezone('Etc/GMT-5')  # Etc/GMT-5 is UTC+5
-        timestamp = timestamp.astimezone(utc_plus_5)
-        formatted_time = timestamp.strftime('%Y-%m-%d %H:%M:%S')
-        message_type = message.get('type')
-        message_body = message.get('text', {}).get('body', '').lower()
+            if from_number not in user_sessions:
+                user_sessions[from_number] = {'authenticated': False, 'awaiting_password': False}
 
-        if from_number not in user_sessions:
-            user_sessions[from_number] = {'authenticated': False, 'awaiting_password': False}
+            is_authenticated = user_sessions[from_number]['authenticated']
+            awaiting_password = user_sessions[from_number]['awaiting_password']
 
-        is_authenticated = user_sessions[from_number]['authenticated']
-        awaiting_password = user_sessions[from_number]['awaiting_password']
+            if message_type == 'text' and (message_body == 'start' or message_body == 'старт'):
+                asyncio.run(send_text_message(from_number, "Введите 4-х значный код для входа"))
+                user_sessions[from_number]['awaiting_password'] = True
+                return jsonify({"status": "password_requested"}), 200
 
-        if message_type == 'text' and (message_body == 'start' or message_body == 'старт'):
-            asyncio.run(send_text_message(from_number, "Введите 4-х значный код для входа"))
-            user_sessions[from_number]['awaiting_password'] = True
-            return jsonify({"status": "password_requested"}), 200
+            elif message_type == 'text' and awaiting_password:
+                entered_password = message.get('text', {}).get('body', '')
+                if entered_password == AUTH_PASSWORD:
+                    user_sessions[from_number]['authenticated'] = True
+                    user_sessions[from_number]['awaiting_password'] = False
+                    asyncio.run(send_text_message(from_number, "Авторизация успешна!"))
+                else:
+                    user_sessions[from_number]['authenticated'] = False
+                    user_sessions[from_number]['awaiting_password'] = False
+                    asyncio.run(send_text_message(from_number, "Неверный код. Введите слово 'старт' и попробуйте еще раз"))
+                return jsonify({"status": "authentication_attempted"}), 200
 
-        elif message_type == 'text' and awaiting_password:
-            entered_password = message.get('text', {}).get('body', '')
-            if entered_password == AUTH_PASSWORD:
-                user_sessions[from_number]['authenticated'] = True
-                user_sessions[from_number]['awaiting_password'] = False
-                asyncio.run(send_text_message(from_number, "Авторизация успешна!"))
-            else:
-                user_sessions[from_number]['authenticated'] = False
-                user_sessions[from_number]['awaiting_password'] = False
-                asyncio.run(send_text_message(from_number, "Неверный код. Введите слово 'старт' и попробуйте еще раз"))
-            return jsonify({"status": "authentication_attempted"}), 200
+            if not is_authenticated and not awaiting_password:
+                logger.info(f"User {from_number} is not authenticated. Prompting to register.")
+                asyncio.run(
+                    send_text_message(from_number, "Для работы с ботом требуется код. Введите 'старт' и пройдите проверку"))
+                return jsonify({"status": "not_authenticated"}), 200
 
-        if not is_authenticated and not awaiting_password:
-            logger.info(f"User {from_number} is not authenticated. Prompting to register.")
-            asyncio.run(
-                send_text_message(from_number, "Для работы с ботом требуется код. Введите 'старт' и пройдите проверку"))
-            return jsonify({"status": "not_authenticated"}), 200
+            elif message_type == 'text' and user_sessions[from_number].get('awaiting_confirmation'):
+                user_response = message_body.strip().lower()
+                result_id = user_sessions[from_number]['result_id']
+                if user_response == 'да':
+                    # User confirmed the detection is correct
+                    asyncio.run(send_text_message(from_number, "Спасибо за подтверждение!"))
+                    # Update the Result record
+                    update_result_with_confirmation(session, result_id)
+                    # Reset the session state
+                    user_sessions[from_number]['awaiting_confirmation'] = False
+                    user_sessions[from_number]['detection'] = ''
+                    user_sessions[from_number]['result_id'] = None
+                elif user_response == 'нет':
+                    # User indicated the detection is incorrect
+                    asyncio.run(send_text_message(from_number, "Пожалуйста, отправьте правильный текст."))
+                    # Update session to expect corrected text
+                    user_sessions[from_number]['awaiting_correction'] = True
+                    user_sessions[from_number]['awaiting_confirmation'] = False
+                else:
+                    # Prompt the user to reply with 'да' или 'нет'
+                    asyncio.run(send_text_message(from_number, "Пожалуйста, ответьте 'да' или 'нет'."))
+                return jsonify({"status": "confirmation_received"}), 200
+            elif message_type == 'text' and user_sessions[from_number].get('awaiting_correction'):
+                corrected_text = message.get('text',{}).get('body','')
+                result_id = user_sessions[from_number]['result_id']
+                #Update the results records
+                update_result_with_correction(session, result_id, corrected_text)
+                asyncio.run(send_text_message(from_number, "Спасибо, мы сохранили вашу корректировку"))
+                user_sessions[from_number]['awaiting_correction'] = False
+                user_sessions[from_number]['detection'] = ''
+                user_sessions[from_number]['result_id'] = None
+                return jsonify({"status": "correction_received"}), 200
 
-        counts = {
-            'text': 0,
-            'image': 0,
-            'video': 0,
-            'audio': 0,
-            'document': 0,
-            'voice': 0,
-            'others': 0
-        }
+            counts = {
+                'text': 0,
+                'image': 0,
+                'video': 0,
+                'audio': 0,
+                'document': 0,
+                'voice': 0,
+                'others': 0
+            }
 
-        has_attachments = False
-        attachment_links = []
+            has_attachments = False
+            attachment_links = []
 
-        if message_type == 'text':
-            # Process text message
-            text = message['text']['body']
-            logger.info(f"Received text from {from_number}: {text}")
+            if message_type == 'text':
+                # Process text message
+                text = message['text']['body']
+                logger.info(f"Received text from {from_number}: {text}")
 
-            # Save to database
-            save_message_to_db(
-                session=session,
-                phone_num=from_number,
-                message_text=text,
-                has_attachments=False,
-                attachment_links='',
-                date_time=timestamp
-            )
-            asyncio.run(save_message(from_number, text, formatted_time))
-
-        elif message_type in ['image', 'video', 'audio', 'document', 'voice']:
-            counts[message_type] += 1
-            media_id = message[message_type]['id']
-            media_url = get_media_url(media_id)
-            filepath, filename, success = download_media(media_url, message_type, from_number, timestamp)
-            if success:
-                has_attachments = True
-                attachment_links = filepath  # Modify if handling multiple attachments
                 # Save to database
                 save_message_to_db(
                     session=session,
                     phone_num=from_number,
-                    message_text='',
-                    has_attachments=True,
-                    attachment_links=filepath,
+                    message_text=text,
+                    has_attachments=False,
+                    attachment_links='',
                     date_time=timestamp
                 )
-                # Notify user
-                asyncio.run(send_async_message_status(from_number, filepath, success, message_type))
-            else:
-                # Notify user about failure
-                asyncio.run(send_async_message_status(from_number, filepath, success, message_type))
-        else:
-            counts['others'] += 1
-            logger.info(f"Received {message_type} message from {from_number}")
-            save_message_to_db(
-                session=session,
-                phone_num=from_number,
-                message_text='',
-                has_attachments=False,
-                attachment_links='',
-                date_time=timestamp
-            )
+                asyncio.run(save_message(from_number, text, formatted_time))
+            elif message_type in ['audio', 'voice']:
+                counts[message_type] += 1
+                media_id = message[message_type]['id']
+                media_url = get_media_url(media_id)
+                filepath, filename, success = download_media(media_url, message_type, from_number, timestamp)
+                if success:
+                    has_attachments = True
+                    attachment_links = filepath
+                    # Send the audio file to the transcription API
+                    detection = send_audio_to_api(filepath)
 
-    return jsonify({"status": "received"}), 200
+                    # Save the message to the database and get the message entry
+                    message_entry = save_message_to_db(
+                        session=session,
+                        phone_num=from_number,
+                        message_text='',
+                        has_attachments=True,
+                        attachment_links=filepath,
+                        date_time=timestamp,
+                        detected_audio=detection
+                    )
+
+                    if message_entry:
+                        # Create a Result entry
+                        result_entry = Result(
+                            message_id=message_entry.id,
+                            audio_file_path=filepath,
+                            audio_file_name=filename,
+                            models_output=detection,
+                            corrected=False,
+                            human_output=None
+                        )
+                        session.add(result_entry)
+                        session.commit()
+
+                        # Send the detected text back to the user and ask if it's correct
+                        asyncio.run(ask_user_for_confirmation(from_number, detection, result_entry.id))
+                    else:
+                        logger.error("Failed to save message to database.")
+                else:
+                    # Notify user about failure
+                    asyncio.run(send_async_message_status(from_number, filepath, success, message_type))
+
+
+            elif message_type in ['image', 'video', 'document']:
+                counts[message_type] += 1
+                media_id = message[message_type]['id']
+                media_url = get_media_url(media_id)
+                filepath, filename, success = download_media(media_url, message_type, from_number, timestamp)
+                if success:
+                    has_attachments = True
+                    attachment_links = filepath  # Modify if handling multiple attachments
+                    # Save to database
+                    save_message_to_db(
+                        session=session,
+                        phone_num=from_number,
+                        message_text='',
+                        has_attachments=True,
+                        attachment_links=filepath,
+                        date_time=timestamp
+                    )
+                    # Notify user
+                    asyncio.run(send_async_message_status(from_number, filepath, success, message_type))
+                else:
+                    # Notify user about failure
+                    asyncio.run(send_async_message_status(from_number, filepath, success, message_type))
+
+
+
+
+            else:
+                counts['others'] += 1
+                logger.info(f"Received {message_type} message from {from_number}")
+                save_message_to_db(
+                    session=session,
+                    phone_num=from_number,
+                    message_text='',
+                    has_attachments=False,
+                    attachment_links='',
+                    date_time=timestamp
+                )
+        return jsonify({"status": "received"}), 200
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        logger.debug("Exception info:", exc_info=True)
+        # Return 200 OK to prevent message retries
+        return jsonify({"status": "error", "message": str(e)}), 200
 
 
 def get_media_url(media_id):
@@ -265,6 +367,7 @@ def download_media(url, media_type, from_number, timestamp):
     logger.info(f"Content-Type: {content_type}")
     # Mapping
     content_type_mapping = {
+        #Audio
         'audio/mpeg': ('.mp3', 'mp3'),
         'audio/mp3': ('.mp3', 'mp3'),
         'audio/ogg': ('.ogg', 'ogg'),
@@ -274,16 +377,33 @@ def download_media(url, media_type, from_number, timestamp):
         'audio/wav': ('.wav', 'wav'),
         'audio/x-wav': ('.wav', 'wav'),
         'audio/webm': ('.webm', 'webm'),
-        'image': '.jpg',
-        'video': '.mp4',
-        'document': '.pdf',
+        # Image MIME types
+        'image/jpeg': ('.jpg', None),
+        'image/png': ('.png', None),
+        'image/gif': ('.gif', None),
+        'image/bmp': ('.bmp', None),
+        'image/webp': ('.webp', None),
+
+        # Video MIME types
+        'video/mp4': ('.mp4', None),
+        'video/quicktime': ('.mov', None),
+        'video/x-msvideo': ('.avi', None),
+        'video/x-matroska': ('.mkv', None),
+
+        # Document MIME types
+        'application/pdf': ('.pdf', None),
+        'application/msword': ('.doc', None),
+        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ('.docx', None),
+        'application/vnd.ms-excel': ('.xls', None),
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ('.xlsx', None),
+
     }
     if content_type in content_type_mapping:
         extension, audio_format = content_type_mapping[content_type]
     else:
-        # Default to .media and 'wav' if unknown
+        # Default to .media and 'None' if unknown
         extension = '.media'
-        audio_format = 'wav'
+        audio_format = None
 
     date_str = timestamp.strftime('%Y-%m-%d')
     time_str = timestamp.strftime('%H-%M-%S')
@@ -294,7 +414,6 @@ def download_media(url, media_type, from_number, timestamp):
     original_filename = f"{media_type}_{sequence_number}_{time_str}{extension}"
     original_filepath = os.path.join(phone_dir, original_filename)
 
-
     try:
         with open(original_filepath, "wb") as f:
             for chunk in response.iter_content(1024):
@@ -303,7 +422,7 @@ def download_media(url, media_type, from_number, timestamp):
         success = True
 
         # If the media is audio or voice, convert it to WAV
-        if media_type in ['audio', 'voice']:
+        if media_type in ['audio', 'voice'] and audio_format is not None:
             try:
                 # Load the audio file using the detected format
                 audio = AudioSegment.from_file(original_filepath, format=audio_format)
@@ -337,38 +456,6 @@ def download_media(url, media_type, from_number, timestamp):
         return original_filepath, original_filename, success
 
 
-# save message text
-async def save_message(from_number, text, timestamp):
-    filename = f"{from_number}.txt"
-    filepath = os.path.join("messages", filename)
-
-    message_content = f"Timestamp: {timestamp}\nFrom: {from_number}\nMessage: {text}\n\n"
-
-    with open(filepath, "a", encoding="utf-8") as f:
-        f.write(message_content)
-
-    message_body = (f"Вы написали {text}, сообщение сохранено в {filepath}")
-    await send_text_message(from_number, message_body)
-
-
-async def send_async_message(data):
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-    }
-    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
-
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, json=data, headers=headers) as response:
-            response_text = await response.text()
-            if response.status in [200, 201]:
-                logger.info("Async message sent successfully!")
-                logger.debug(f"Response: {response_text}")
-            else:
-                logger.error(f"Async send failed: {response.status}")
-                logger.error(f"Response: {response_text}")
-
-
 def get_text_message_input(recipient, text):
     """Generate JSON payload for text message."""
     formatted_recipient = recipient.lstrip('+')
@@ -386,11 +473,6 @@ def get_text_message_input(recipient, text):
         "type": "text",
         "text": {"body": text}
     }
-
-
-async def send_text_message(from_number, message_body):
-    data = get_text_message_input(from_number, message_body)
-    await send_async_message(data)
 
 
 def get_or_create_phone_number(session, phone_num):
@@ -438,46 +520,60 @@ def fetch_whatsapp_name(phone_num):
         return 'Unknown'
 
 
-
-def save_message_to_db(session, phone_num, message_text, has_attachments, attachment_links, date_time):
+def save_message_to_db(session, phone_num, message_text, has_attachments, attachment_links, date_time, detected_audio=None):
     """Save a message to the database."""
     phone_entry = get_or_create_phone_number(session, phone_num)
     if not phone_entry:
         logger.error(f"Failed to retrieve or create phone number entry for {phone_num}. Skipping message save.")
-        return
+        return None
     message_entry = Message(
         phone_num=phone_num,
         name=phone_entry.name,
         message_text=message_text,
         hasAttachments=has_attachments,
         attachment_links=attachment_links,
-        date_time=date_time
+        date_time=date_time,
+        detected_audio=detected_audio
     )
     session.add(message_entry)
     try:
         session.commit()
         logger.info(f"Saved message from {phone_num} to database.")
+        return message_entry
     except SQLAlchemyError as e:
         logger.error(f"Error saving message from {phone_num}: {e}")
         session.rollback()
+        return None
 
 
-async def send_async_message_status(from_number, filepath, success, message_type):
-    msg_type_forms = {
-        'text': 'текстовое сообщение',
-        'image': 'изображение',
-        'video': 'видео',
-        'audio': 'аудио',
-        'document': 'документ',
-        'voice': 'голосовое сообщение',
-        'others': 'другое сообщение',
-    }
+def update_result_with_confirmation(session, result_id):
+    """Update the Result record when user confirms the model's output is correct."""
+    try:
+        result_entry = session.query(Result).filter_by(id=result_id).first()
+        if result_entry:
+            result_entry.corrected = False  # User confirmed the output is correct
+            session.commit()
+            logger.info(f"Updated result with id {result_id} as confirmed correct.")
+        else:
+            logger.warning(f"No result entry found with id: {result_id}")
+    except SQLAlchemyError as e:
+        logger.error(f"Error updating result with id {result_id}: {e}")
+        session.rollback()
 
-    if success:
-        message_body = f"Вы отправили :{msg_type_forms.get(message_type)}, успешно сохранено в {filepath}"
-    else:
-        message_body = f"Не удалось сохранить {msg_type_forms.get(message_type)}, попробуйте еще раз"
-    await send_text_message(from_number, message_body)
+def update_result_with_correction(session, result_id, corrected_text):
+    """Update the Result record with the corrected text from the user."""
+    try:
+        result_entry = session.query(Result).filter_by(id=result_id).first()
+        if result_entry:
+            result_entry.corrected = True
+            result_entry.human_output = corrected_text
+            session.commit()
+            logger.info(f"Updated result with id {result_id} with corrected text.")
+        else:
+            logger.warning(f"No result entry found with id: {result_id}")
+    except SQLAlchemyError as e:
+        logger.error(f"Error updating result with id {result_id}: {e}")
+        session.rollback()
 
 
 def insert_phone_number(phone_num: str, name: str, whatsapp_name: str):
@@ -501,7 +597,6 @@ def insert_phone_number(phone_num: str, name: str, whatsapp_name: str):
     finally:
         session.close()
 
-
 def test_connection():
     try:
         engine = create_engine(DATABASE_URL)
@@ -516,6 +611,71 @@ def test_connection():
 def create_tables():
     Base.metadata.create_all(bind=engine)
     print("Tables created successfully")
+
+
+# save message text
+async def save_message(from_number, text, timestamp):
+    filename = f"{from_number}.txt"
+    filepath = os.path.join("messages", filename)
+
+    message_content = f"Timestamp: {timestamp}\nFrom: {from_number}\nMessage: {text}\n\n"
+
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(message_content)
+
+    message_body = (f"Вы написали {text}, сообщение сохранено в {filepath}")
+    await send_text_message(from_number, message_body)
+
+
+async def send_async_message(data):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+    }
+    url = f"https://graph.facebook.com/{VERSION}/{PHONE_NUMBER_ID}/messages"
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, json=data, headers=headers) as response:
+            response_text = await response.text()
+            if response.status in [200, 201]:
+                logger.info("Async message sent successfully!")
+                logger.debug(f"Response: {response_text}")
+            else:
+                logger.error(f"Async send failed: {response.status}")
+                logger.error(f"Response: {response_text}")
+
+
+async def ask_user_for_confirmation(from_number, detection, result_id):
+    message_body = f"Мы распознали: \"{detection}\". Это правильно? Пожалуйста, ответьте 'да' или 'нет'."
+    await send_text_message(from_number, message_body)
+    # Update user session to expect confirmation
+    user_sessions[from_number]['awaiting_confirmation'] = True
+    user_sessions[from_number]['detection'] = detection
+    user_sessions[from_number]['result_id'] = result_id
+
+
+async def send_async_message_status(from_number, filepath, success, message_type):
+    msg_type_forms = {
+        'text': 'текстовое сообщение',
+        'image': 'изображение',
+        'video': 'видео',
+        'audio': 'аудио',
+        'document': 'документ',
+        'voice': 'голосовое сообщение',
+        'others': 'другое сообщение',
+    }
+
+    if success:
+        message_body = f"Вы отправили :{msg_type_forms.get(message_type)}, успешно сохранено в {filepath}"
+    else:
+        message_body = f"Не удалось сохранить {msg_type_forms.get(message_type)}, попробуйте еще раз"
+    await send_text_message(from_number, message_body)
+
+
+async def send_text_message(from_number, message_body):
+    data = get_text_message_input(from_number, message_body)
+    await send_async_message(data)
+
 
 if __name__ == "__main__":
     test_connection()
