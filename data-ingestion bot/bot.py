@@ -18,6 +18,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from script import send_audio_to_api
 
+
 app = Flask(__name__)
 
 # Load environment variables
@@ -446,6 +447,7 @@ def download_media(url, media_type, from_number, timestamp):
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ('.xlsx', None),
 
     }
+                         
     if content_type in content_type_mapping:
         extension, audio_format = content_type_mapping[content_type]
     else:
@@ -460,6 +462,7 @@ def download_media(url, media_type, from_number, timestamp):
 
     original_filename = f"{media_type}_{sequence_number}_{time_str}{extension}"
     original_filepath = os.path.join(phone_dir, original_filename)
+
 
     try:
         with open(original_filepath, "wb") as f:
@@ -713,7 +716,6 @@ async def save_message(from_number, text, timestamp):
 async def send_text_message(from_number, message_body):
     data = get_text_message_input(from_number, message_body)
     await send_async_message(data)
-
 
 if __name__ == "__main__":
     test_connection()
