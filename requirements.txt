@@ -3,3 +3,6 @@ aiohttp~=3.10.10
 asyncio~=3.4.3
 python-dotenv~=1.0.1
 flask~=3.0.3
+pytz~=2024.2
+pydub~=0.25.1
+SQLAlchemy~=2.0.36
