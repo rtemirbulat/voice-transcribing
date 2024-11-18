@@ -17,6 +17,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from script import send_audio_to_api
+from sqlalchemy.sql import func
 
 
 app = Flask(__name__)
@@ -66,7 +67,7 @@ Base = declarative_base()
 
 # DB models
 class PhoneNumber(Base):
-    __tablename__ = 'phone_num'
+    __tablename__ = 'phone_num_ent'
 
     phone_num = Column(String, primary_key=True, unique=True, nullable=True)
     name = Column(String, nullable=True)
@@ -76,36 +77,32 @@ class PhoneNumber(Base):
 
 
 class Message(Base):
-    __tablename__ = 'messages'
+    __tablename__ = 'messages_ent'
 
     id = Column(Integer, primary_key=True, index=True)
-    phone_num = Column(String, ForeignKey('phone_num.phone_num'), nullable=True)
+    phone_num = Column(String, ForeignKey('phone_num_ent.phone_num'), nullable=True)
     name = Column(String, nullable=True)
     message_text = Column(Text, nullable=True)
     hasAttachments = Column(Boolean, default=False)
     attachment_links = Column(Text, nullable=True)  # Comma-separated links
     date_time = Column(DateTime, nullable=True)
     detected_audio = Column(String, nullable=True)
-    rut_type = Column(String, nullable=True)
-    router = Column(String, nullable=True)
-    oiler_number = Column(String, nullable=True)
-    cdng = Column(String, nullable=True)
-    ngdu = Column(String, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
     ip_address = Column(String, nullable=True)
     result = relationship("Result", uselist=False, back_populates="message")
     phone_number_ref = relationship("PhoneNumber", back_populates="messages")
 
 
 class Result(Base):
-    __tablename__ = 'results'
+    __tablename__ = 'results_ent'
 
     id = Column(Integer, primary_key=True, index=True)
-    message_id = Column(Integer, ForeignKey('messages.id'))
+    message_id = Column(Integer, ForeignKey('messages_ent.id'))
     audio_file_path = Column(String, nullable=False)
     audio_file_name = Column(String, nullable=False)
     models_output = Column(Text, nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
     corrected = Column(Boolean, default=False)
-    human_output = Column(Text, nullable=True)
 
     message = relationship("Message", back_populates="result")
 
@@ -188,10 +185,6 @@ def handle_message():
                 user_sessions[from_number] = {
                     'authenticated': False,
                     'awaiting_password': False,
-                    'awaiting_confirmation': False,
-                    'awaiting_correction': False,
-                    'detection': '',
-                    'result_id': None,
                     'language': None,
                     'awaiting_language_selection': False
                 }
@@ -249,46 +242,6 @@ def handle_message():
                 asyncio.run(send_text_message(from_number, auth_required_msg))
                 return jsonify({"status": "not_authenticated"}), 200
 
-            # Confirmation for our model to re-train it back again
-            if message_type == 'text' and user_sessions[from_number].get('awaiting_confirmation'):
-                user_response = message_body.strip().lower()
-                result_id = user_sessions[from_number]['result_id']
-
-                affirmative = ['иә'] if language == 'kk' else ['да']
-                negative = ['жоқ'] if language == 'kk' else ['нет']
-
-                if user_response in affirmative:
-                    confirmation_message = get_message_text('confirmation_thanks', language)
-                    asyncio.run(send_text_message(from_number, confirmation_message))
-                    # Update the Result record
-                    update_result(session, result_id, corrected=False)
-                    # Reset the session state
-                    user_sessions[from_number]['awaiting_confirmation'] = False
-                    user_sessions[from_number]['detection'] = ''
-                    user_sessions[from_number]['result_id'] = None
-                elif user_response in negative:
-                    correction_prompt = get_message_text('correction_prompt', language)
-                    asyncio.run(send_text_message(from_number, correction_prompt))
-                    # Update session to expect corrected text
-                    user_sessions[from_number]['awaiting_correction'] = True
-                    user_sessions[from_number]['awaiting_confirmation'] = False
-                else:
-                    retry_message = get_message_text('confirmation_retry', language)
-                    asyncio.run(send_text_message(from_number, retry_message))
-                return jsonify({"status": "confirmation_received"}), 200
-
-            if message_type == 'text' and user_sessions[from_number].get('awaiting_correction'):
-                corrected_text = message_body
-                result_id = user_sessions[from_number]['result_id']
-                # Update the Result record
-                update_result(session, result_id, corrected=True, human_output=corrected_text)
-                correction_thanks = get_message_text('correction_thanks', language)
-                asyncio.run(send_text_message(from_number, correction_thanks))
-                user_sessions[from_number]['awaiting_correction'] = False
-                user_sessions[from_number]['detection'] = ''
-                user_sessions[from_number]['result_id'] = None
-                return jsonify({"status": "correction_received"}), 200
-
             #  For text messages:
             if message_type == 'text':
                 text = message['text']['body']
@@ -331,12 +284,12 @@ def handle_message():
                             audio_file_name=filename,
                             models_output=detection,
                             corrected=False,
-                            human_output=None
                         )
                         session.add(result_entry)
                         session.commit()
 
-                        asyncio.run(ask_user_for_confirmation(from_number, detection, result_entry.id))
+                        message_body = f" \"{detection}\""
+                        asyncio.run(send_text_message(from_number, message_body))
                     else:
                         logger.error("Failed to save message to database.")
                 else:
@@ -447,7 +400,7 @@ def download_media(url, media_type, from_number, timestamp):
         'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ('.xlsx', None),
 
     }
-                         
+
     if content_type in content_type_mapping:
         extension, audio_format = content_type_mapping[content_type]
     else:
@@ -547,28 +500,6 @@ def save_message_to_db(session, phone_num, message_text, has_attachments, attach
 def get_message_text(message_key, language):
     return MESSAGES.get(message_key, {}).get(language, '')
 
-
-def update_result(session, result_id, corrected, human_output=None):
-    """Update the Result record based on user's confirmation or correction.
-
-    Args:
-        session: Database session.
-        result_id: ID of the Result record.
-        corrected: Boolean indicating if the result was corrected.
-        human_output: The corrected text provided by the user (if any).
-    """
-    try:
-        result_entry = session.query(Result).filter_by(id=result_id).first()
-        if result_entry:
-            result_entry.corrected = corrected
-            result_entry.human_output = human_output
-            session.commit()
-            logger.info(f"Updated result with id {result_id}. Corrected: {corrected}")
-        else:
-            logger.warning(f"No result entry found with id: {result_id}")
-    except SQLAlchemyError as e:
-        logger.error(f"Error updating result with id {result_id}: {e}")
-        session.rollback()
 
 def get_or_create_phone_number(session, phone_num):
 
@@ -670,20 +601,6 @@ async def send_authentication_prompt(from_number):
     await send_text_message(from_number, message_body)
     user_sessions[from_number]['awaiting_password'] = True
 
-
-async def ask_user_for_confirmation(from_number, detection, result_id):
-    language = user_sessions[from_number]['language']
-    if language == 'kk':
-        message_body = f"Біз танылдық: \"{detection}\". Бұл дұрыс па? 'Иә' немесе 'жоқ' деп жауап беріңіз."
-    elif language == 'ru':
-        message_body = f"Мы распознали: \"{detection}\". Это правильно? Пожалуйста, ответьте 'да' или 'нет'."
-    else:
-        message_body = f"Мы распознали: \"{detection}\". Это правильно? Пожалуйста, ответьте 'да' или 'нет'."
-    await send_text_message(from_number, message_body)
-    # Update user session to expect confirmation
-    user_sessions[from_number]['awaiting_confirmation'] = True
-    user_sessions[from_number]['detection'] = detection
-    user_sessions[from_number]['result_id'] = result_id
 
 
 async def send_async_message_status(from_number, filepath, success, message_type):
